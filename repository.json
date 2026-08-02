@@ -1,0 +1,9 @@
+{
+  "app_id": "io.github.vincentzyuapps.dartflutterdemo",
+  "arch": "x86_64",
+  "branch": "stable",
+  "fingerprint": "34DA05F98B42968BCCCDDF1B35831D1AE820C955",
+  "repository_url": "https://vincentzyuapps.github.io/flatpak-repo/repo/",
+  "source_url": "https://github.com/VincentZyuApps/dart-flutter-demo",
+  "version": "0.5.0-beta.13"
+}
