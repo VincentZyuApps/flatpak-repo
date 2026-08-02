@@ -94,6 +94,8 @@ class WorkflowTest(unittest.TestCase):
         )
         self.assertIn("environment: flatpak-production", workflow)
         self.assertIn("publish-v*", workflow)
+        self.assertIn("flatpak-publish-request.json", workflow)
+        self.assertIn("should_publish", workflow)
         self.assertIn("repo-state", workflow)
         self.assertIn("actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e", workflow)
         self.assertNotIn('echo "$PRIVATE_KEY"', workflow)

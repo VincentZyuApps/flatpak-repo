@@ -36,6 +36,6 @@ flatpak update --user io.github.vincentzyuapps.dartflutterdemo
 
 `main` 分支只保存工作流、公开公钥、渲染脚本和文档。`repo-state` 分支由 GitHub Actions 维护，持久保存生成的 OSTree 仓库、静态 delta、`.flatpakref` 和 `.flatpakrepo`。
 
-应用仓库中的 `[build-publish]` 会先创建完整 GitHub Release，再向本仓库推送 `publish-v<version>` 标签。标签触发的工作流从 Release 下载版本化 `.flatpak`，验证身份和分支，使用 `flatpak-production` Environment 中的 GPG 密钥签名，并通过 GitHub Pages 部署。
+应用仓库中的 `[build-publish]` 会先创建完整 GitHub Release，并附加 `flatpak-publish-request.json` 发布标记。本仓库定时发现新标记，也支持手动指定 Release 标签立即运行。工作流从 Release 下载版本化 `.flatpak`，验证身份和分支，使用 `flatpak-production` Environment 中的 GPG 密钥签名，并通过 GitHub Pages 部署。
 
 私钥和口令不得提交到任何分支、Artifact、Pages 或日志。公开公钥位于 [`keys/flatpak-repo-signing-public.asc`](keys/flatpak-repo-signing-public.asc)。

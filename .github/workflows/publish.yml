@@ -6,6 +6,8 @@ on:
   push:
     tags:
       - 'publish-v*'
+  schedule:
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       release_tag:
@@ -28,23 +30,21 @@ env:
   STATE_BRANCH: repo-state
 
 jobs:
-  publish:
-    name: Sign and update repository
+  resolve:
+    name: Resolve publication request
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    environment: flatpak-production
+    timeout-minutes: 5
     outputs:
+      bundle: ${{ steps.release.outputs.bundle }}
       release_tag: ${{ steps.release.outputs.tag }}
+      should_publish: ${{ steps.release.outputs.should_publish }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
       - name: Resolve and validate Release
         id: release
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           MANUAL_TAG: ${{ inputs.release_tag || '' }}
         run: |
           set -euo pipefail
@@ -53,6 +53,16 @@ jobs:
               publish-v*) RELEASE_TAG="${GITHUB_REF_NAME#publish-}" ;;
               *) echo "Unexpected publish tag: $GITHUB_REF_NAME" >&2; exit 1 ;;
             esac
+          elif [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            RELEASE_TAG="$(
+              gh api "repos/${SOURCE_REPOSITORY}/releases?per_page=100" \
+                --jq '[.[] | select(.draft == false) | select(any(.assets[]; .name == "flatpak-publish-request.json"))][0].tag_name // empty'
+            )"
+            if [[ -z "$RELEASE_TAG" ]]; then
+              echo "No Flatpak publication request is available."
+              echo "should_publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           else
             RELEASE_TAG="$MANUAL_TAG"
           fi
@@ -61,9 +71,33 @@ jobs:
             exit 1
           fi
           VERSION="${RELEASE_TAG#v}"
+          SHOULD_PUBLISH=true
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            CURRENT_VERSION="$(
+              curl --fail --silent --show-error \
+                https://vincentzyuapps.github.io/flatpak-repo/repository.json |
+                jq -r '.version // empty'
+            )" || CURRENT_VERSION=""
+            if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
+              SHOULD_PUBLISH=false
+            fi
+          fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "bundle=dart-flutter-demo-linux-x64-v${VERSION}.flatpak" >> "$GITHUB_OUTPUT"
+          echo "should_publish=$SHOULD_PUBLISH" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Sign and update repository
+    needs: resolve
+    if: needs.resolve.outputs.should_publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: flatpak-production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
       - name: Install Flatpak repository tools
         run: |
@@ -73,8 +107,8 @@ jobs:
       - name: Download versioned Flatpak bundle
         shell: bash
         env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          BUNDLE: ${{ steps.release.outputs.bundle }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          BUNDLE: ${{ needs.resolve.outputs.bundle }}
         run: |
           set -euo pipefail
           mkdir -p incoming
@@ -132,7 +166,7 @@ jobs:
       - name: Sign and update stable repository
         shell: bash
         env:
-          BUNDLE: ${{ steps.release.outputs.bundle }}
+          BUNDLE: ${{ needs.resolve.outputs.bundle }}
         run: |
           set -euo pipefail
           flatpak build-import-bundle \
@@ -160,7 +194,7 @@ jobs:
           set -euo pipefail
           python3 scripts/render_repository_files.py \
             --output-directory state \
-            --version "${{ steps.release.outputs.version }}" \
+            --version "${{ needs.resolve.outputs.version }}" \
             --public-key keys/flatpak-repo-signing-public.asc \
             --fingerprint "$SIGNING_KEY"
 
@@ -196,7 +230,7 @@ jobs:
           if git -C state diff --cached --quiet; then
             echo "Repository state is unchanged."
           else
-            git -C state commit -m "chore(repo): publish ${{ steps.release.outputs.tag }}"
+            git -C state commit -m "chore(repo): publish ${{ needs.resolve.outputs.release_tag }}"
             git -C state push origin "$STATE_BRANCH"
           fi
 
