@@ -1,0 +1,258 @@
+name: Publish Flatpak Repository
+
+run-name: Publish ${{ inputs.release_tag || github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'publish-v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing dart-flutter-demo GitHub Release tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: flatpak-repository-production
+  cancel-in-progress: false
+
+env:
+  APP_ID: io.github.vincentzyuapps.dartflutterdemo
+  SOURCE_REPOSITORY: VincentZyuApps/dart-flutter-demo
+  STATE_BRANCH: repo-state
+
+jobs:
+  publish:
+    name: Sign and update repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: flatpak-production
+    outputs:
+      release_tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate Release
+        id: release
+        shell: bash
+        env:
+          MANUAL_TAG: ${{ inputs.release_tag || '' }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            case "$GITHUB_REF_NAME" in
+              publish-v*) RELEASE_TAG="${GITHUB_REF_NAME#publish-}" ;;
+              *) echo "Unexpected publish tag: $GITHUB_REF_NAME" >&2; exit 1 ;;
+            esac
+          else
+            RELEASE_TAG="$MANUAL_TAG"
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
+            echo "Invalid Release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "bundle=dart-flutter-demo-linux-x64-v${VERSION}.flatpak" >> "$GITHUB_OUTPUT"
+
+      - name: Install Flatpak repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak ostree
+
+      - name: Download versioned Flatpak bundle
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          BUNDLE: ${{ steps.release.outputs.bundle }}
+        run: |
+          set -euo pipefail
+          mkdir -p incoming
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://github.com/${SOURCE_REPOSITORY}/releases/download/${RELEASE_TAG}/${BUNDLE}" \
+            --output "incoming/${BUNDLE}"
+          test -s "incoming/${BUNDLE}"
+          sha256sum "incoming/${BUNDLE}"
+
+      - name: Restore persistent repository state
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "$STATE_BRANCH" >/dev/null; then
+            git fetch origin "$STATE_BRANCH:refs/remotes/origin/$STATE_BRANCH"
+            git worktree add -B "$STATE_BRANCH" state "refs/remotes/origin/$STATE_BRANCH"
+          else
+            git worktree add --orphan -b "$STATE_BRANCH" state
+          fi
+          if [[ ! -f state/repo/config ]]; then
+            mkdir -p state/repo
+            ostree init --repo=state/repo --mode=archive-z2
+          fi
+
+      - name: Import protected signing key
+        shell: bash
+        env:
+          PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.FLATPAK_GPG_PASSPHRASE }}
+          EXPECTED_KEY: ${{ vars.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          GNUPGHOME="$RUNNER_TEMP/flatpak-gnupg"
+          PRIVATE_KEY_FILE="$RUNNER_TEMP/flatpak-private.asc"
+          PASSPHRASE_FILE="$RUNNER_TEMP/flatpak-passphrase"
+          install -d -m 0700 "$GNUPGHOME"
+          printf '%s\n' "$PRIVATE_KEY" > "$PRIVATE_KEY_FILE"
+          printf '%s' "$PASSPHRASE" > "$PASSPHRASE_FILE"
+          chmod 0600 "$PRIVATE_KEY_FILE" "$PASSPHRASE_FILE"
+          gpg --homedir "$GNUPGHOME" --batch --import "$PRIVATE_KEY_FILE"
+          ACTUAL_KEY="$(
+            gpg --homedir "$GNUPGHOME" --batch --with-colons \
+              --fingerprint "$EXPECTED_KEY" |
+              awk -F: '$1 == "fpr" { print $10; exit }'
+          )"
+          test "$ACTUAL_KEY" = "$EXPECTED_KEY"
+          gpg --homedir "$GNUPGHOME" --batch --yes \
+            --pinentry-mode loopback --passphrase-file "$PASSPHRASE_FILE" \
+            --local-user "$EXPECTED_KEY" --output "$RUNNER_TEMP/unlock.sig" \
+            --detach-sign /dev/null
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "PASSPHRASE_FILE=$PASSPHRASE_FILE" >> "$GITHUB_ENV"
+          echo "SIGNING_KEY=$EXPECTED_KEY" >> "$GITHUB_ENV"
+
+      - name: Sign and update stable repository
+        shell: bash
+        env:
+          BUNDLE: ${{ steps.release.outputs.bundle }}
+        run: |
+          set -euo pipefail
+          flatpak build-import-bundle \
+            --gpg-sign="$SIGNING_KEY" \
+            --gpg-homedir="$GNUPGHOME" \
+            --update-appstream \
+            state/repo "incoming/$BUNDLE"
+          flatpak build-update-repo \
+            --title="dart-flutter-demo" \
+            --comment="Signed stable Flatpak repository" \
+            --description="Self-hosted Flatpak updates for dart-flutter-demo" \
+            --homepage="https://github.com/$SOURCE_REPOSITORY" \
+            --default-branch=stable \
+            --gpg-import=keys/flatpak-repo-signing-public.asc \
+            --gpg-sign="$SIGNING_KEY" \
+            --gpg-homedir="$GNUPGHOME" \
+            --generate-static-deltas \
+            --prune \
+            --prune-depth=2 \
+            state/repo
+
+      - name: Render repository descriptors and page
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/render_repository_files.py \
+            --output-directory state \
+            --version "${{ steps.release.outputs.version }}" \
+            --public-key keys/flatpak-repo-signing-public.asc \
+            --fingerprint "$SIGNING_KEY"
+
+      - name: Verify signed repository locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s state/repo/summary
+          test -s state/repo/summary.sig
+          test -s state/dart-flutter-demo.flatpakrepo
+          test -s state/dart-flutter-demo.flatpakref
+          test -s state/repository.json
+          test -f state/.nojekyll
+          ISOLATED_HOME="$RUNNER_TEMP/flatpak-client-home"
+          ISOLATED_DATA="$RUNNER_TEMP/flatpak-client-data"
+          mkdir -p "$ISOLATED_HOME" "$ISOLATED_DATA"
+          HOME="$ISOLATED_HOME" XDG_DATA_HOME="$ISOLATED_DATA" \
+            flatpak remote-add --user --if-not-exists \
+              --gpg-import=keys/flatpak-repo-signing-public.asc \
+              local-test "file://$PWD/state/repo"
+          EXPECTED_REF="$APP_ID"$'\t'"stable"$'\t'"x86_64"
+          HOME="$ISOLATED_HOME" XDG_DATA_HOME="$ISOLATED_DATA" \
+            flatpak remote-ls --user --columns=application,branch,arch local-test |
+            grep -Fqx "$EXPECTED_REF"
+
+      - name: Persist generated repository state
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C state config user.name github-actions[bot]
+          git -C state config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C state add --all
+          if git -C state diff --cached --quiet; then
+            echo "Repository state is unchanged."
+          else
+            git -C state commit -m "chore(repo): publish ${{ steps.release.outputs.tag }}"
+            git -C state push origin "$STATE_BRANCH"
+          fi
+
+      - name: Prepare Pages snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages
+          rsync -a --exclude='.git' state/ pages/
+          test ! -e pages/.git
+
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: pages
+
+  deploy:
+    name: Deploy GitHub Pages
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+  verify-public:
+    name: Verify public signed repository
+    needs: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install Flatpak client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak
+
+      - name: Wait for Pages and verify GPG-enabled remote
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_URL="https://vincentzyuapps.github.io/flatpak-repo"
+          curl --fail --location --retry 12 --retry-delay 5 --retry-all-errors \
+            "$BASE_URL/repository.json" --output repository.json
+          curl --fail --location --retry 12 --retry-delay 5 --retry-all-errors \
+            "$BASE_URL/repo/summary" --output summary
+          test -s repository.json
+          test -s summary
+          flatpak remote-add --user --if-not-exists \
+            dart-flutter-demo "$BASE_URL/dart-flutter-demo.flatpakrepo"
+          EXPECTED_REF="$APP_ID"$'\t'"stable"$'\t'"x86_64"
+          flatpak remote-ls --user --columns=application,branch,arch \
+            dart-flutter-demo |
+            grep -Fqx "$EXPECTED_REF"
