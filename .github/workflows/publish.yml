@@ -1,18 +1,21 @@
 name: Publish Flatpak Repository
 
-run-name: Publish ${{ inputs.release_tag || github.ref_name }}
+run-name: Publish ${{ inputs.release_tag }} from dart run ${{ inputs.source_run_id || 'manual' }}.${{ inputs.source_run_attempt || '1' }}
 
 on:
-  push:
-    tags:
-      - 'publish-v*'
-  schedule:
-    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       release_tag:
         description: Existing dart-flutter-demo GitHub Release tag
         required: true
+        type: string
+      source_run_id:
+        description: Source dart-flutter-demo Actions run ID
+        required: false
+        type: string
+      source_run_attempt:
+        description: Source dart-flutter-demo Actions run attempt
+        required: false
         type: string
 
 permissions:
@@ -45,47 +48,52 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          MANUAL_TAG: ${{ inputs.release_tag || '' }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id || '' }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt || '1' }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            case "$GITHUB_REF_NAME" in
-              publish-v*) RELEASE_TAG="${GITHUB_REF_NAME#publish-}" ;;
-              *) echo "Unexpected publish tag: $GITHUB_REF_NAME" >&2; exit 1 ;;
-            esac
-          elif [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
-            RELEASE_TAG="$(
-              gh api "repos/${SOURCE_REPOSITORY}/releases?per_page=100" \
-                --jq '[.[] | select(.draft == false) | select(any(.assets[]; .name == "flatpak-publish-request.json"))][0].tag_name // empty'
-            )"
-            if [[ -z "$RELEASE_TAG" ]]; then
-              echo "No Flatpak publication request is available."
-              echo "should_publish=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          else
-            RELEASE_TAG="$MANUAL_TAG"
-          fi
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
             echo "Invalid Release tag: $RELEASE_TAG" >&2
             exit 1
           fi
-          VERSION="${RELEASE_TAG#v}"
-          SHOULD_PUBLISH=true
-          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
-            CURRENT_VERSION="$(
-              curl --fail --silent --show-error \
-                https://vincentzyuapps.github.io/flatpak-repo/repository.json |
-                jq -r '.version // empty'
-            )" || CURRENT_VERSION=""
-            if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
-              SHOULD_PUBLISH=false
-            fi
+          if [[ -n "$SOURCE_RUN_ID" && ! "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid source Actions run ID: $SOURCE_RUN_ID" >&2
+            exit 1
           fi
+          if [[ ! "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid source Actions run attempt: $SOURCE_RUN_ATTEMPT" >&2
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
+          BUNDLE="dart-flutter-demo-linux-x64-v${VERSION}.flatpak"
+          RELEASE_JSON="$(gh api "repos/${SOURCE_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          test "$(jq -r '.draft' <<< "$RELEASE_JSON")" = "false"
+          jq -e --arg name "$BUNDLE" \
+            'any(.assets[]; .name == $name)' <<< "$RELEASE_JSON" >/dev/null
+          jq -e \
+            'any(.assets[]; .name == "flatpak-publish-request.json")' \
+            <<< "$RELEASE_JSON" >/dev/null
+          gh release download "$RELEASE_TAG" \
+            --repo "$SOURCE_REPOSITORY" \
+            --pattern flatpak-publish-request.json \
+            --dir request
+          jq -e \
+            --arg app_id "$APP_ID" \
+            --arg bundle "$BUNDLE" \
+            --arg release_tag "$RELEASE_TAG" \
+            '.schema_version == 1 and
+             .app_id == $app_id and
+             .arch == "x86_64" and
+             .branch == "stable" and
+             .bundle == $bundle and
+             .release_tag == $release_tag and
+             .repository == "VincentZyuApps/flatpak-repo"' \
+            request/flatpak-publish-request.json >/dev/null
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "bundle=dart-flutter-demo-linux-x64-v${VERSION}.flatpak" >> "$GITHUB_OUTPUT"
-          echo "should_publish=$SHOULD_PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "bundle=$BUNDLE" >> "$GITHUB_OUTPUT"
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Sign and update repository
@@ -132,6 +140,8 @@ jobs:
             mkdir -p state/repo
             ostree init --repo=state/repo --mode=archive-z2
           fi
+          # Git cannot preserve empty OSTree directories on repo-state.
+          mkdir -p state/repo/refs/remotes
 
       - name: Import protected signing key
         shell: bash
